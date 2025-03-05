@@ -1,42 +1,48 @@
 #include "matching_engine.hpp"
+#include <algorithm>
+#include <iostream>
 
 namespace MatchingEngine
 {
 
-// =============
+// ===================
 // OrderBook
-// =============
+// ===================
 
 OrderBook::OrderBook(MatchingEngine* parent)
-    : lastTradePrice(0.0),
-      parentEngine_(parent)
+  : parentEngine_(parent)
 {
 }
 
 std::vector<Fill> OrderBook::addOrder(Order&& order)
 {
     std::lock_guard<std::mutex> lock(bookMutex);
-    std::vector<Fill> fills;
 
+    std::vector<Fill> fills;
     if (order.type == OrderType::StopLoss)
     {
+        // store stop order for future triggers
         stopOrders.push_back(std::move(order));
         return fills;
     }
 
     fills = matchOrder(order);
 
+    // if it's a limit order and there's leftover quantity, place it
     if (order.type == OrderType::Limit && order.quantity > 0)
     {
         placeLimitOrder(std::move(order));
     }
 
+    // update last trade price from any fills
     for (auto& f : fills)
     {
         lastTradePrice = f.price;
     }
-    auto stopFills = checkStopOrders(lastTradePrice);
-    fills.insert(fills.end(), stopFills.begin(), stopFills.end());
+
+    // now see if these fills triggered any stop orders
+    auto triggeredFills = checkStopOrders(lastTradePrice);
+    fills.insert(fills.end(), triggeredFills.begin(), triggeredFills.end());
 
     return fills;
 }
@@ -44,18 +50,21 @@ std::vector<Fill> OrderBook::addOrder(Order&& order)
 std::vector<Fill> OrderBook::checkStopOrders(double tradedPrice)
 {
     std::vector<Fill> allFills;
+
     auto it = stopOrders.begin();
     while (it != stopOrders.end())
     {
         bool triggered = false;
         if (it->isBuy)
         {
+            // stop buy triggers if trade price >= stopPrice
             if (tradedPrice >= it->stopPrice) {
                 triggered = true;
             }
         }
         else
         {
+            // stop sell triggers if trade price <= stopPrice
             if (tradedPrice <= it->stopPrice) {
                 triggered = true;
             }
@@ -63,9 +72,9 @@ std::vector<Fill> OrderBook::checkStopOrders(double tradedPrice)
 
         if (triggered)
         {
-            Order triggeredOrder(it->id, it->user, OrderType::Market,
-                                 it->isBuy, 0.0, 0.0, it->quantity, it->sessionId);
-
+            // convert to a market order
+            Order triggeredOrder(it->id, it->isBuy, OrderType::Market,
+                                 0.0, 0.0, it->quantity, it->sessionId);
             auto fills = matchOrder(triggeredOrder);
             for (auto& f : fills) {
                 lastTradePrice = f.price;
@@ -79,6 +88,7 @@ std::vector<Fill> OrderBook::checkStopOrders(double tradedPrice)
             ++it;
         }
     }
+
     return allFills;
 }
 
@@ -88,21 +98,21 @@ std::vector<Fill> OrderBook::matchOrder(Order& incoming)
 
     if (incoming.isBuy)
     {
+        // match buy against best sells
         while (incoming.quantity > 0 && !sellBook.empty())
         {
-            auto bestSellIt = sellBook.begin();
+            auto bestSellIt = sellBook.begin(); // lowest price
             double bestSellPrice = bestSellIt->first;
             if (incoming.type == OrderType::Limit && incoming.price < bestSellPrice) {
-                break;
+                break; // no match
             }
             auto& level = bestSellIt->second;
             while (incoming.quantity > 0 && !level.empty())
             {
-                auto& sellOrder = level.front();
-                double matchPrice = sellOrder.price;
-                consumeOrder(incoming, sellOrder, matchPrice, fills);
-
-                if (sellOrder.quantity == 0) {
+                auto& maker = level.front();
+                double matchPrice = maker.price;
+                consumeOrder(incoming, maker, matchPrice, fills);
+                if (maker.quantity == 0) {
                     level.pop_front();
                 }
                 if (incoming.quantity == 0) {
@@ -116,21 +126,21 @@ std::vector<Fill> OrderBook::matchOrder(Order& incoming)
     }
     else
     {
+        // match sell against best buys
         while (incoming.quantity > 0 && !buyBook.empty())
         {
-            auto bestBuyIt = buyBook.begin();
+            auto bestBuyIt = buyBook.begin(); // highest price first
             double bestBuyPrice = bestBuyIt->first;
             if (incoming.type == OrderType::Limit && incoming.price > bestBuyPrice) {
-                break;
+                break; // no match
             }
             auto& level = bestBuyIt->second;
             while (incoming.quantity > 0 && !level.empty())
             {
-                auto& buyOrder = level.front();
-                double matchPrice = buyOrder.price;
-                consumeOrder(buyOrder, incoming, matchPrice, fills);
-
-                if (buyOrder.quantity == 0) {
+                auto& maker = level.front();
+                double matchPrice = maker.price;
+                consumeOrder(incoming, maker, matchPrice, fills);
+                if (maker.quantity == 0) {
                     level.pop_front();
                 }
                 if (incoming.quantity == 0) {
@@ -142,24 +152,24 @@ std::vector<Fill> OrderBook::matchOrder(Order& incoming)
             }
         }
     }
+
     return fills;
 }
 
-void OrderBook::consumeOrder(Order& incoming, Order& existing, double matchPrice, std::vector<Fill>& fills)
+void OrderBook::consumeOrder(Order& taker, Order& maker, double matchPrice, std::vector<Fill>& fills)
 {
-    uint64_t tradedQty = std::min(incoming.quantity, existing.quantity);
-
-    incoming.quantity -= tradedQty;
-    existing.quantity -= tradedQty;
+    uint64_t traded = std::min(taker.quantity, maker.quantity);
+    taker.quantity -= traded;
+    maker.quantity -= traded;
 
     Fill fill;
-    fill.makerOrderId = existing.id;
-    fill.makerSession = existing.sessionId;
-    fill.takerOrderId = incoming.id;
-    fill.takerSession = incoming.sessionId;
-    fill.price = matchPrice;
-    fill.quantity = tradedQty;
-    fill.isBuy = incoming.isBuy;
+    fill.takerOrderId   = taker.id;
+    fill.takerSession   = taker.sessionId;
+    fill.makerOrderId   = maker.id;
+    fill.makerSession   = maker.sessionId;
+    fill.price          = matchPrice;
+    fill.quantity       = traded;
+    fill.isBuy          = taker.isBuy; // from the taker's perspective
 
     fills.push_back(fill);
 }
@@ -186,28 +196,13 @@ void OrderBook::placeLimitOrder(Order&& order)
     }
 }
 
-double OrderBook::bestBid() const
-{
-    std::lock_guard<std::mutex> lock(bookMutex);
-    if (buyBook.empty()) return 0.0;
-    return buyBook.begin()->first;
-}
-
-double OrderBook::bestAsk() const
-{
-    std::lock_guard<std::mutex> lock(bookMutex);
-    if (sellBook.empty()) return 0.0;
-    return sellBook.begin()->first;
-}
-
-
-// =============
+// ===================
 // MatchingEngine
-// =============
+// ===================
 
 MatchingEngine::MatchingEngine()
-    : book(this),
-      running(false)
+  : book_(this),
+    running_(false)
 {
 }
 
@@ -218,80 +213,63 @@ MatchingEngine::~MatchingEngine()
 
 void MatchingEngine::start()
 {
-    running.store(true);
-    matchingThread = std::thread([this] { matchingLoop(); });
+    running_.store(true);
+    matchingThread_ = std::thread([this]{ matchingLoop(); });
 }
 
 void MatchingEngine::stop()
 {
-    running.store(false);
-    cv.notify_one();
-    if (matchingThread.joinable())
-        matchingThread.join();
-}
-
-std::vector<Fill> MatchingEngine::onNewOrder(Order&& order)
-{
-    std::unique_lock<std::mutex> lock(queueMutex);
-    orderQueue.push_back(OrderMessage{ std::move(order) });
-    cv.notify_one();
-    return {};
-}
-
-void MatchingEngine::addUser(const std::string& user, const std::string& pass)
-{
-    std::lock_guard<std::mutex> lock(userMutex);
-    users[user] = UserAuth{user, pass};
-}
-
-bool MatchingEngine::authenticate(const std::string& user, const std::string& pass) const
-{
-    std::lock_guard<std::mutex> lock(userMutex);
-    auto it = users.find(user);
-    if (it == users.end()) return false;
-    return (it->second.password == pass);
+    running_.store(false);
+    cv_.notify_one();
+    if (matchingThread_.joinable()) {
+        matchingThread_.join();
+    }
 }
 
 void MatchingEngine::matchingLoop()
 {
-    while (running.load())
+    while (running_.load())
     {
-        std::deque<OrderMessage> localQueue;
+        std::deque<OrderMsg> localQueue;
         {
-            std::unique_lock<std::mutex> lock(queueMutex);
-            cv.wait(lock, [this] {
-                return !running.load() || !orderQueue.empty();
+            std::unique_lock<std::mutex> lock(queueMutex_);
+            cv_.wait(lock, [this] {
+                return !running_.load() || !orderQueue_.empty();
             });
-            if (!running.load() && orderQueue.empty())
+            if (!running_.load() && orderQueue_.empty()) {
                 break;
-            localQueue.swap(orderQueue);
+            }
+            localQueue.swap(orderQueue_);
         }
 
+        // Process orders
         while (!localQueue.empty())
         {
             auto msg = std::move(localQueue.front());
             localQueue.pop_front();
 
-            std::vector<Fill> fills;
-            {
-                std::lock_guard<std::mutex> lock(engineMutex);
-                fills = book.addOrder(std::move(msg.order));
-            }
-            if (!fills.empty())
-            {
+            std::vector<Fill> fills = book_.addOrder(std::move(msg.order));
+            if (!fills.empty()) {
                 notifyFills(fills);
             }
         }
     }
 }
 
-// =============
-// Fill Callbacks
-// =============
-void MatchingEngine::registerSession(SessionId sid, std::function<void(const Fill&)>&& callback)
+void MatchingEngine::submitOrder(Order&& order)
+{
+    {
+        std::lock_guard<std::mutex> lock(queueMutex_);
+        orderQueue_.push_back(OrderMsg{std::move(order)});
+    }
+    cv_.notify_one();
+}
+
+// session callbacks
+void MatchingEngine::registerSession(SessionId sid, std::function<void(const Fill&)>&& cb)
 {
     std::lock_guard<std::mutex> lock(callbackMutex_);
-    sessionCallbacks_[sid] = std::move(callback);
+    sessionCallbacks_[sid] = std::move(cb);
 }
 
 void MatchingEngine::unregisterSession(SessionId sid)
@@ -303,18 +281,19 @@ void MatchingEngine::unregisterSession(SessionId sid)
 void MatchingEngine::notifyFills(const std::vector<Fill>& fills)
 {
     std::lock_guard<std::mutex> lock(callbackMutex_);
-
-    for (auto& fill : fills)
+    for (auto& f : fills)
     {
-        auto makerIt = sessionCallbacks_.find(fill.makerSession);
-        if (makerIt != sessionCallbacks_.end()) {
-            makerIt->second(fill);
+        // notify maker
+        auto mit = sessionCallbacks_.find(f.makerSession);
+        if (mit != sessionCallbacks_.end()) {
+            mit->second(f);
         }
-        auto takerIt = sessionCallbacks_.find(fill.takerSession);
-        if (takerIt != sessionCallbacks_.end()) {
-            takerIt->second(fill);
+        // notify taker
+        auto tit = sessionCallbacks_.find(f.takerSession);
+        if (tit != sessionCallbacks_.end()) {
+            tit->second(f);
         }
     }
 }
 
-}
+} // namespace MatchingEngine

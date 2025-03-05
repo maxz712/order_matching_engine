@@ -1,17 +1,17 @@
 #include "matching_engine.hpp"
-#include <iostream>
+#include <boost/asio.hpp>
+#include <boost/asio/ssl.hpp>
 #include <sstream>
 #include <atomic>
 #include <memory>
-#include <boost/asio.hpp>
-#include <boost/asio/ssl.hpp>
+#include <iostream>
 
 using boost::asio::ip::tcp;
 namespace ssl = boost::asio::ssl;
 
 namespace Server
 {
-static std::atomic<uint64_t> gSessionCounter{1};
+static std::atomic<uint64_t> gSessionIdCounter{1};
 
 class Session : public std::enable_shared_from_this<Session>
 {
@@ -19,32 +19,28 @@ public:
     Session(tcp::socket socket,
             ssl::context& sslContext,
             MatchingEngine::MatchingEngine& engine)
-        : sslStream_(std::move(socket), sslContext)
-        , engine_(engine)
-        , sessionId_(gSessionCounter.fetch_add(1))
+      : sslStream_(std::move(socket), sslContext)
+      , engine_(engine)
+      , sessionId_(gSessionIdCounter.fetch_add(1))
     {
     }
 
     void start()
     {
-        engine_.registerSession(sessionId_, [thisWeak = weak_from_this()](const MatchingEngine::Fill& fill)
-        {
-            if (auto self = thisWeak.lock())
-            {
+        // Register fill callback
+        engine_.registerSession(sessionId_, [weakSelf = weak_from_this()](const MatchingEngine::Fill& fill){
+            if (auto self = weakSelf.lock()) {
                 self->onFill(fill);
             }
         });
 
+        // Async SSL handshake
         auto self(shared_from_this());
         sslStream_.async_handshake(ssl::stream_base::server,
-            [this, self](const boost::system::error_code& ec)
-            {
-                if (!ec)
-                {
+            [this, self](const boost::system::error_code& ec){
+                if (!ec) {
                     doRead();
-                }
-                else
-                {
+                } else {
                     std::cerr << "Handshake failed: " << ec.message() << std::endl;
                 }
             });
@@ -53,96 +49,87 @@ public:
     void stop()
     {
         engine_.unregisterSession(sessionId_);
-
-        boost::system::error_code ignored_ec;
-        sslStream_.lowest_layer().close(ignored_ec);
+        // Close socket
+        boost::system::error_code ignored;
+        sslStream_.lowest_layer().close(ignored);
     }
 
 private:
+    // Continuously read lines (commands)
     void doRead()
     {
         auto self(shared_from_this());
         boost::asio::async_read_until(sslStream_, buffer_, '\n',
-            [this, self](boost::system::error_code ec, std::size_t length)
-            {
-                if (!ec)
-                {
+            [this, self](boost::system::error_code ec, std::size_t length){
+                if (!ec) {
                     std::string line(
                         boost::asio::buffers_begin(buffer_.data()),
                         boost::asio::buffers_begin(buffer_.data()) + length
                     );
                     buffer_.consume(length);
+
                     processLine(line);
-                    doRead();
+                    doRead();  // read the next command
                 }
-                else
-                {
-                    if (ec != boost::asio::error::eof)
-                    {
-                        std::cerr << "Read error: " << ec.message() << std::endl;
-                    }
+                else {
                     stop();
                 }
             });
     }
 
+    // parse an order command, e.g.:
+    // ORDER buy limit 100.0 10
+    // ORDER sell stop 101 20
+    // ORDER buy market 0 15
     void processLine(const std::string& line)
     {
         std::istringstream iss(line);
         std::string cmd;
         iss >> cmd;
 
-        if (cmd == "LOGIN")
+        if (cmd == "ORDER")
         {
-            std::string user, pass;
-            iss >> user >> pass;
-            bool ok = engine_.authenticate(user, pass);
-            if (ok)
-            {
-                currentUser_ = user;
-                writeLine("LOGIN OK\n");
-            }
-            else
-            {
-                writeLine("LOGIN FAILED\n");
-            }
-        }
-        else if (cmd == "ORDER")
-        {
-            if (currentUser_.empty())
-            {
-                writeLine("ERROR: Not logged in\n");
-                return;
-            }
-            static uint64_t globalOrderId = 1;
             std::string sideStr, typeStr;
             double price;
             uint64_t qty;
+
             iss >> sideStr >> typeStr >> price >> qty;
 
             bool isBuy = (sideStr == "buy");
             MatchingEngine::OrderType ot = MatchingEngine::OrderType::Limit;
             double stopP = 0.0;
+
             if (typeStr == "market")
+            {
                 ot = MatchingEngine::OrderType::Market;
+                // price is not used, but we read it anyway
+            }
             else if (typeStr == "stop")
             {
                 ot = MatchingEngine::OrderType::StopLoss;
-                stopP = price;
+                stopP = price; // put the price as stopPrice
                 price = 0.0;
             }
+            else if (typeStr == "limit")
+            {
+                ot = MatchingEngine::OrderType::Limit;
+            }
 
+            static std::atomic<uint64_t> globalOrderId{1};
+            uint64_t thisOrderId = globalOrderId.fetch_add(1);
+
+            // Construct order
             MatchingEngine::Order order(
-                globalOrderId++,
-                currentUser_,
-                ot,
+                thisOrderId,
                 isBuy,
+                ot,
                 price,
                 stopP,
                 qty,
                 sessionId_
             );
-            engine_.onNewOrder(std::move(order));
+            // Submit to engine
+            engine_.submitOrder(std::move(order));
 
             writeLine("ORDER ACCEPTED\n");
         }
@@ -152,27 +139,26 @@ private:
         }
     }
 
+    // Called by the engine when this session's order is filled
     void onFill(const MatchingEngine::Fill& fill)
     {
+        // Format a message
         std::ostringstream ss;
         ss << "FILL: maker=" << fill.makerOrderId
            << " taker=" << fill.takerOrderId
            << " price=" << fill.price
            << " qty=" << fill.quantity
-           << " isBuy=" << (fill.isBuy ? "true" : "false")
-           << "\n";
+           << " isBuy=" << (fill.isBuy ? "true" : "false") << "\n";
         writeLine(ss.str());
     }
 
     void writeLine(const std::string& msg)
     {
         auto self(shared_from_this());
-        boost::asio::async_write(sslStream_, boost::asio::buffer(msg),
-            [this, self](boost::system::error_code ec, std::size_t)
-            {
-                if (ec)
-                {
-                    std::cerr << "Write error: " << ec.message() << std::endl;
+        boost::asio::async_write(sslStream_,
+            boost::asio::buffer(msg),
+            [this, self](boost::system::error_code ec, std::size_t){
+                if (ec) {
                     stop();
                 }
             });
@@ -183,19 +169,17 @@ private:
     boost::asio::streambuf buffer_;
     MatchingEngine::MatchingEngine& engine_;
     MatchingEngine::SessionId sessionId_;
-    std::string currentUser_;
 };
 
 class Server
 {
 public:
-    Server(boost::asio::io_context& ioc,
-           unsigned short port,
+    Server(boost::asio::io_context& ioc, unsigned short port,
            ssl::context& sslContext,
            MatchingEngine::MatchingEngine& engine)
-        : acceptor_(ioc, tcp::endpoint(tcp::v4(), port))
-        , sslContext_(sslContext)
-        , engine_(engine)
+      : acceptor_(ioc, tcp::endpoint(tcp::v4(), port))
+      , sslContext_(sslContext)
+      , engine_(engine)
     {
         doAccept();
     }
@@ -204,14 +188,10 @@ private:
     void doAccept()
     {
         acceptor_.async_accept(
-            [this](boost::system::error_code ec, tcp::socket socket)
-            {
-                if (!ec)
-                {
+            [this](boost::system::error_code ec, tcp::socket socket){
+                if (!ec) {
                     auto session = std::make_shared<Session>(
-                        std::move(socket),
-                        sslContext_,
-                        engine_);
+                        std::move(socket), sslContext_, engine_);
                     session->start();
                 }
                 doAccept();
@@ -223,4 +203,4 @@ private:
     MatchingEngine::MatchingEngine& engine_;
 };
 
-}
+} // namespace Server

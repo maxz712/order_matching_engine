@@ -2,7 +2,6 @@
 
 #include <map>
 #include <deque>
-#include <string>
 #include <functional>
 #include <unordered_map>
 #include <vector>
@@ -14,107 +13,95 @@
 
 namespace MatchingEngine
 {
+// A SessionId to identify each TCP connection
 using SessionId = uint64_t;
 
+// Order types
 enum class OrderType { Market, Limit, StopLoss };
 
+// Each incoming order
 struct Order
 {
     uint64_t id;
-    std::string user;
-    OrderType type;
     bool isBuy;
-    double price;
-    double stopPrice;
+    OrderType type;
+    double price;       // limit or trigger price
+    double stopPrice;   // used if type == StopLoss
     uint64_t quantity;
 
+    // Which session placed this order
     SessionId sessionId;
 
     std::chrono::steady_clock::time_point timestamp;
 
-    Order(uint64_t id_,
-          const std::string& usr,
-          OrderType t,
-          bool buy,
-          double p,
-          double sp,
-          uint64_t qty,
-          SessionId sid)
-        : id(id_),
-          user(usr),
-          type(t),
-          isBuy(buy),
-          price(p),
-          stopPrice(sp),
-          quantity(qty),
-          sessionId(sid),
-          timestamp(std::chrono::steady_clock::now())
+    Order(uint64_t _id, bool buy, OrderType _type, double p, double sp, uint64_t qty, SessionId sid)
+      : id(_id)
+      , isBuy(buy)
+      , type(_type)
+      , price(p)
+      , stopPrice(sp)
+      , quantity(qty)
+      , sessionId(sid)
+      , timestamp(std::chrono::steady_clock::now())
     {}
 };
 
+// When two orders match, we generate a Fill event
 struct Fill
 {
     uint64_t makerOrderId;
     uint64_t takerOrderId;
+
+    // maker/taker sessions (so we know who to notify)
     SessionId makerSession;
     SessionId takerSession;
 
     double price;
     uint64_t quantity;
+    // perspective of the taker: is the taker buying?
     bool isBuy;
 };
 
-struct UserAuth
-{
-    std::string username;
-    std::string password;
-};
-
+// Forward declare the engine so OrderBook can refer to it
 class MatchingEngine;
 
-// =========================
-//  OrderBook
-// =========================
-
+// The OrderBook manages the in-memory buy/sell lists for a single instrument
 class OrderBook
 {
 public:
-    OrderBook(MatchingEngine* parent);
+    // pass pointer to the parent engine for fill notifications
+    explicit OrderBook(MatchingEngine* parent);
 
+    // Add an order to the book; returns a list of fills that occurred
     std::vector<Fill> addOrder(Order&& order);
-
-    std::vector<Fill> checkStopOrders(double lastTradePrice);
-
-    double bestBid() const;
-    double bestAsk() const;
 
 private:
     using PriceLevel = std::deque<Order>;
 
+    // For buy side, we sort in descending price
     struct Descending
     {
         bool operator()(double a, double b) const { return a > b; }
     };
 
+    // The buy book (keyed descending) and sell book (ascending)
     std::map<double, PriceLevel, Descending> buyBook;
     std::map<double, PriceLevel> sellBook;
+
+    // We keep stop orders off-book until triggered
     std::vector<Order> stopOrders;
+
+    double lastTradePrice = 0.0;          // track last match price for stop triggers
+    MatchingEngine* parentEngine_ = nullptr;
     mutable std::mutex bookMutex;
 
-    double lastTradePrice;
-
-    MatchingEngine* parentEngine_;
-
     std::vector<Fill> matchOrder(Order& incoming);
-    void consumeOrder(Order& incoming, Order& existing, double matchPrice, std::vector<Fill>& fills);
-
+    void consumeOrder(Order& taker, Order& maker, double matchPrice, std::vector<Fill>& fills);
     void placeLimitOrder(Order&& order);
+    std::vector<Fill> checkStopOrders(double tradedPrice);
 };
 
-// =========================
-//  MatchingEngine
-// =========================
-
+// The main MatchingEngine class
 class MatchingEngine
 {
 public:
@@ -124,37 +111,34 @@ public:
     void start();
     void stop();
 
-    std::vector<Fill> onNewOrder(Order&& order);
+    // The interface to place a new order
+    void submitOrder(Order&& order);
 
-    void addUser(const std::string& user, const std::string& pass);
-    bool authenticate(const std::string& user, const std::string& pass) const;
-
-    void registerSession(SessionId sid, std::function<void(const Fill&)>&& callback);
+    // Register/unregister session callbacks for fill notifications
+    void registerSession(SessionId sid, std::function<void(const Fill&)>&& cb);
     void unregisterSession(SessionId sid);
 
+    // Called by OrderBook to distribute fill events
     void notifyFills(const std::vector<Fill>& fills);
 
 private:
-    OrderBook book;
+    // A single OrderBook for demonstration
+    OrderBook book_;
 
-    std::atomic<bool> running;
-    std::thread matchingThread;
-    std::condition_variable cv;
-    std::mutex queueMutex, engineMutex;
+    // concurrency
+    std::atomic<bool> running_;
+    std::thread matchingThread_;
+    std::mutex queueMutex_;
+    std::condition_variable cv_;
 
-    struct OrderMessage
-    {
-        Order order;
-    };
-    std::deque<OrderMessage> orderQueue;
+    struct OrderMsg { Order order; };
+    std::deque<OrderMsg> orderQueue_;
 
-    std::unordered_map<std::string, UserAuth> users;
-    mutable std::mutex userMutex;
-
+    // callbacks for real-time fill notifications
     std::unordered_map<SessionId, std::function<void(const Fill&)>> sessionCallbacks_;
     std::mutex callbackMutex_;
 
     void matchingLoop();
 };
 
-}
+} // namespace MatchingEngine

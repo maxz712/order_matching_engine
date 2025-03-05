@@ -1,30 +1,28 @@
 #include "matching_engine.hpp"
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
-#include <iostream>
 #include <csignal>
+#include <iostream>
 
 #include "server.cpp"
 
 int main()
 {
-    namespace ssl = boost::asio::ssl;
+    // Prepare the matching engine
     MatchingEngine::MatchingEngine engine;
-    engine.addUser("alice", "alicepass");
-    engine.addUser("bob",   "bobpass");
-
     engine.start();
 
+    // Setup Boost.Asio
     boost::asio::io_context ioc;
+    namespace ssl = boost::asio::ssl;
+
     ssl::context ctx(ssl::context::tls_server);
-
-    ctx.set_options(
-        ssl::context::default_workarounds
-        | ssl::context::no_sslv2
-        | ssl::context::single_dh_use);
-
+    // Load self-signed cert, key, etc.
     ctx.use_certificate_chain_file("../server.crt");
     ctx.use_private_key_file("../server.key", ssl::context::pem);
+    ctx.set_options(ssl::context::default_workarounds
+                    | ssl::context::no_sslv2
+                    | ssl::context::single_dh_use);
 
     unsigned short port = 12345;
     try
@@ -42,6 +40,7 @@ int main()
         std::cerr << "Exception: " << e.what() << std::endl;
     }
 
+    // Cleanup
     engine.stop();
     return 0;
 }
